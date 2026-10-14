@@ -23,17 +23,19 @@ GROUPS = os.environ.get("SCAN_GROUPS", "sp500,watchlist").split(",")  # 앞 그�
 
 BB_LEN = int(os.environ.get("BB_LEN", "20"))                    # 볼린저밴드 기간
 BB_STD = float(os.environ.get("BB_STD", "2.0"))                 # 볼린저밴드 표준편차 배수
-PCTB_MAX = float(os.environ.get("PCTB_MAX", "-0.1"))            # ① 이탈일 %B가 이 값보다 작아야 함 (하단을 확실히 뚫음)
-LOOKBACK = int(os.environ.get("LOOKBACK", "1"))                 # ④ 이탈일이 오늘 기준 며칠 전까지 허용되는지 (1 = 어제)
+PCTB_MAX = float(os.environ.get("PCTB_MAX", "0"))               # ① 이탈일 %B가 이 값보다 작아야 함 (0 = 하단 아래 마감)
+LOOKBACK = int(os.environ.get("LOOKBACK", "3"))                 # ④ 이탈일이 오늘 기준 며칠 전까지 허용되는지 (3 = 3거래일 전까지)
 
-RSI2_MAX = float(os.environ.get("RSI2_MAX", "5"))               # ② 이탈일 RSI(2) < 5
-RSI14_MAX = float(os.environ.get("RSI14_MAX", "30"))            # ② 또는 RSI(14) < 30
+RSI2_MAX = float(os.environ.get("RSI2_MAX", "10"))              # ② 이탈일 RSI(2) < 10
+RSI14_MAX = float(os.environ.get("RSI14_MAX", "35"))            # ② 또는 RSI(14) < 35
 
 REQUIRE_VOL_SPIKE = os.environ.get("REQUIRE_VOL_SPIKE", "1") == "1"
-VOL_SPIKE = float(os.environ.get("VOL_SPIKE", "1.5"))           # ⑤ 이탈일 거래량 ≥ 50일 평균 × 1.5
+VOL_SPIKE = float(os.environ.get("VOL_SPIKE", "1.2"))           # ⑤ 이탈일 거래량 ≥ 50일 평균 × 1.2
 REQUIRE_NO_GAP = os.environ.get("REQUIRE_NO_GAP", "1") == "1"
 GAP_DOWN_PCT = float(os.environ.get("GAP_DOWN_PCT", "8"))       # ⑥ 이탈일·오늘 시가가 전일 종가보다 8% 이상 낮으면 제외
-MAX_ABOVE_200 = float(os.environ.get("MAX_ABOVE_200", "15"))    # ③⑦ 오늘 종가가 200일선 위 0~15% 이내
+MAX_ABOVE_200 = float(os.environ.get("MAX_ABOVE_200", "30"))    # ③⑦ 오늘 종가가 200일선 위 0~30% 이내
+WATCH_ENABLE = os.environ.get("WATCH_ENABLE", "1") == "1"       # 반등 대기(관찰) 목록 켜기
+WATCH_TOP = int(os.environ.get("WATCH_TOP", "25"))              # 관찰 목록 최대 개수 (이탈 깊은 순)
 
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($)
@@ -189,6 +191,44 @@ def find_signal(df: pd.DataFrame, today: dt.date | None) -> dict | None:
     return None
 
 
+def find_watch(df: pd.DataFrame, today: dt.date | None) -> dict | None:
+    """반등 대기: 오늘 종가가 밴드 하단 아래 + 과매도 + 상승 추세 + 악재 갭 아님 (반등 확인·거래량 조건 없음)"""
+    df = df.dropna(subset=["Open", "Close", "High", "Low", "Volume"])
+    if len(df) < 210 or (today is not None and df.index[-1].date() != today):
+        return None
+    o, c, l, v = df["Open"], df["Close"], df["Low"], df["Volume"]
+    last = float(c.iloc[-1])
+    if last < MIN_PRICE or (c * v).tail(50).mean() < MIN_DOLLAR_VOL:
+        return None
+    mid = c.rolling(BB_LEN).mean()
+    sd = c.rolling(BB_LEN).std(ddof=0)
+    upper, lower = mid + BB_STD * sd, mid - BB_STD * sd
+    pctb = (c - lower) / (upper - lower)
+    if not pctb.iloc[-1] < PCTB_MAX:
+        return None
+    r2, r14 = float(rsi(c, 2).iloc[-1]), float(rsi(c, 14).iloc[-1])
+    if not (r2 < RSI2_MAX or r14 < RSI14_MAX):
+        return None
+    s200 = float(c.rolling(200).mean().iloc[-1])
+    above200 = (last / s200 - 1) * 100
+    if not (0 < above200 <= MAX_ABOVE_200):
+        return None
+    gap = float((o.iloc[-1] / c.iloc[-2] - 1) * 100)
+    if REQUIRE_NO_GAP and gap <= -GAP_DOWN_PCT:
+        return None
+    days_out = 0                                           # 연속으로 밴드 밖에서 마감한 일수
+    for j in range(len(df) - 1, 0, -1):
+        if c.iloc[j] < lower.iloc[j]:
+            days_out += 1
+        else:
+            break
+    vavg = v.rolling(50).mean().shift(1).iloc[-1]
+    return {"pctb": float(pctb.iloc[-1]), "rsi2": r2, "rsi14": r14, "days_out": days_out,
+            "vol_x": float(v.iloc[-1] / vavg) if vavg else float("nan"), "gap": gap,
+            "above200": float(above200), "last": last, "target": float(mid.iloc[-1]),
+            "lower": float(lower.iloc[-1]), "low": float(l.iloc[-1])}
+
+
 # ───────────── 기타 ─────────────
 def company_name(ticker: str) -> str:
     cache_file = STATE / "names.json"
@@ -242,6 +282,22 @@ def send_table(title: str, rows: list[dict]):
         first = False
 
 
+def send_watch_table(title: str, rows: list[dict]):
+    head = (f"{'TICKER':<7}{'NAME':<14}{'OUT':>4}{'%B':>6}{'RSI2':>5}{'RSI14':>6}"
+            f"{'VOLx':>5}{'200%':>6}{'LAST':>8}{'LOWER':>8}{'MID':>8}")
+    lines = [f"{r['ticker']:<7}{r['name'][:12]:<14}{r['days_out']:>4}{r['pctb']:>6.2f}{r['rsi2']:>5.0f}{r['rsi14']:>6.0f}"
+             f"{r['vol_x']:>5.1f}{r['above200']:>6.1f}{r['last']:>8.2f}{r['lower']:>8.2f}{r['target']:>8.2f}" for r in rows]
+    first = True
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1700:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else ""
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first = False
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -271,11 +327,17 @@ def main():
         return
 
     found: dict[str, list] = {}
+    watch: list[dict] = []
     scanned = 0
     for ticker, df in download(list(meta)):
         scanned += 1
         s = find_signal(df, None if FORCE else today)
         if not s:
+            if WATCH_ENABLE:
+                w = find_watch(df, None if FORCE else today)
+                if w:
+                    m = meta[ticker]
+                    watch.append({"ticker": ticker, "name": str(m.name) or company_name(ticker), **w})
             continue
         if not FORCE:
             if ticker in sent:
@@ -286,12 +348,18 @@ def main():
             {"ticker": ticker, "name": str(m.name) or company_name(ticker), **s})
 
     total = sum(len(v) for v in found.values())
-    print(f"시세 확인 {scanned}종목, 신규 신호 {total}건")
+    print(f"시세 확인 {scanned}종목, 신규 신호 {total}건, 반등 대기 {len(watch)}건")
+    post(f"**{now:%b} {now.day} | 볼린저밴드 과매도**\n"
+         f"반등 확인(진입 신호) **{total}**건" + (f" · 반등 대기(관찰) **{len(watch)}**건" if WATCH_ENABLE else ""))
     for g in universes:
         rows = found.get(g)
         if rows:
             rows.sort(key=lambda r: -r["rr"])                # 손익비 좋은 순
-            send_table(f"{now:%b} {now.day} | Bollinger Oversold Rebound | {GROUP_LABEL.get(g, g)}", rows)
+            send_table(f"반등 확인 (진입 신호) | {GROUP_LABEL.get(g, g)}", rows)
+    if WATCH_ENABLE and watch:
+        watch.sort(key=lambda r: r["pctb"])               # 밴드 밖으로 깊이 나간 순
+        extra = f" — 전체 {len(watch)}건 중 이탈 깊은 순 {WATCH_TOP}개" if len(watch) > WATCH_TOP else ""
+        send_watch_table(f"반등 대기 (관찰) | 지금 밴드 밖, 아직 반등 전{extra}", watch[:WATCH_TOP])
 
     if scanned < len(meta) * 0.5:
         post(f"⚠️ 볼린저 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
